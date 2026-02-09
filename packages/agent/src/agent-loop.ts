@@ -5,6 +5,7 @@
 
 import {
 	type AssistantMessage,
+	type AssistantMessageEvent,
 	type Context,
 	EventStream,
 	streamSimple,
@@ -96,6 +97,126 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+}
+
+const SMOOTH_TEXT_DELTA_MIN_CHARS_PER_EMIT = 1;
+const SMOOTH_TEXT_DELTA_MAX_CHARS_PER_EMIT = 2;
+const SMOOTH_TEXT_DELTA_BASE_CHARS_PER_SECOND = 90;
+const SMOOTH_TEXT_DELTA_MIN_CHARS_PER_SECOND = 40;
+const SMOOTH_TEXT_DELTA_MAX_CHARS_PER_SECOND = 2000;
+const SMOOTH_TEXT_DELTA_MAX_DELAY_MS = 18;
+const SMOOTH_TEXT_DELTA_HIGH_WATERMARK = 160;
+const SMOOTH_TEXT_DELTA_CATCHUP_WINDOW_MS = 220;
+
+function clamp(value: number, min: number, max: number): number {
+	return Math.max(min, Math.min(max, value));
+}
+
+function appendTextDelta(message: AssistantMessage, contentIndex: number, delta: string): AssistantMessage {
+	if (!delta) return message;
+	const content = message.content[contentIndex];
+	if (!content || content.type !== "text") return message;
+
+	const nextContent = [...message.content];
+	nextContent[contentIndex] = {
+		...content,
+		text: content.text + delta,
+	};
+
+	return {
+		...message,
+		content: nextContent,
+	};
+}
+
+function waitWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
+	if (ms <= 0) return Promise.resolve();
+
+	return new Promise<void>((resolve) => {
+		const timer = setTimeout(() => {
+			cleanup();
+			resolve();
+		}, ms);
+
+		const onAbort = () => {
+			cleanup();
+			resolve();
+		};
+
+		const cleanup = () => {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		};
+
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+async function emitSmoothedTextDeltaUpdates(
+	event: Extract<AssistantMessageEvent, { type: "text_delta" }>,
+	previousPartial: AssistantMessage,
+	stream: EventStream<AgentEvent, AgentMessage[]>,
+	targetCharsPerSecond: number,
+	signal?: AbortSignal,
+): Promise<AssistantMessage> {
+	const pendingCodePoints = Array.from(event.delta);
+	if (pendingCodePoints.length <= SMOOTH_TEXT_DELTA_MAX_CHARS_PER_EMIT) {
+		stream.push({
+			type: "message_update",
+			assistantMessageEvent: event,
+			message: { ...event.partial },
+		});
+		return event.partial;
+	}
+
+	let partial = previousPartial;
+	while (pendingCodePoints.length > 0) {
+		const backlog = pendingCodePoints.length;
+		const emitChars =
+			backlog >= SMOOTH_TEXT_DELTA_HIGH_WATERMARK
+				? SMOOTH_TEXT_DELTA_MAX_CHARS_PER_EMIT
+				: SMOOTH_TEXT_DELTA_MIN_CHARS_PER_EMIT;
+		const chunk = pendingCodePoints.splice(0, emitChars).join("");
+
+		partial = appendTextDelta(partial, event.contentIndex, chunk);
+		stream.push({
+			type: "message_update",
+			assistantMessageEvent: {
+				type: "text_delta",
+				contentIndex: event.contentIndex,
+				delta: chunk,
+				partial,
+			},
+			message: { ...partial },
+		});
+
+		if (pendingCodePoints.length === 0) {
+			break;
+		}
+
+		const clampedRate = clamp(
+			targetCharsPerSecond,
+			SMOOTH_TEXT_DELTA_MIN_CHARS_PER_SECOND,
+			SMOOTH_TEXT_DELTA_MAX_CHARS_PER_SECOND,
+		);
+		const catchUpRate =
+			backlog > SMOOTH_TEXT_DELTA_HIGH_WATERMARK
+				? (backlog / SMOOTH_TEXT_DELTA_CATCHUP_WINDOW_MS) * 1000
+				: clampedRate;
+		const effectiveRate = clamp(
+			Math.max(clampedRate, catchUpRate),
+			SMOOTH_TEXT_DELTA_MIN_CHARS_PER_SECOND,
+			SMOOTH_TEXT_DELTA_MAX_CHARS_PER_SECOND,
+		);
+
+		const delayMs =
+			backlog > SMOOTH_TEXT_DELTA_HIGH_WATERMARK * 2
+				? 0
+				: Math.min(SMOOTH_TEXT_DELTA_MAX_DELAY_MS, Math.round((emitChars / effectiveRate) * 1000));
+		await waitWithAbort(delayMs, signal);
+	}
+
+	return event.partial;
 }
 
 /**
@@ -238,6 +359,8 @@ async function streamAssistantResponse(
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
+	let estimatedIngressCharsPerSecond = SMOOTH_TEXT_DELTA_BASE_CHARS_PER_SECOND;
+	let lastTextDeltaTimestampMs: number | undefined;
 
 	for await (const event of response) {
 		switch (event.type) {
@@ -248,8 +371,29 @@ async function streamAssistantResponse(
 				stream.push({ type: "message_start", message: { ...partialMessage } });
 				break;
 
-			case "text_start":
 			case "text_delta":
+				if (partialMessage) {
+					const deltaChars = Array.from(event.delta).length;
+					const now = Date.now();
+					if (deltaChars > 0 && lastTextDeltaTimestampMs !== undefined) {
+						const elapsedMs = Math.max(1, now - lastTextDeltaTimestampMs);
+						const observedCharsPerSecond = (deltaChars / elapsedMs) * 1000;
+						estimatedIngressCharsPerSecond = estimatedIngressCharsPerSecond * 0.7 + observedCharsPerSecond * 0.3;
+					}
+					lastTextDeltaTimestampMs = now;
+
+					partialMessage = await emitSmoothedTextDeltaUpdates(
+						event,
+						partialMessage,
+						stream,
+						estimatedIngressCharsPerSecond,
+						signal,
+					);
+					context.messages[context.messages.length - 1] = partialMessage;
+				}
+				break;
+
+			case "text_start":
 			case "text_end":
 			case "thinking_start":
 			case "thinking_delta":

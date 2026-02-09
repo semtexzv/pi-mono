@@ -11,6 +11,7 @@ import {
 	type ToolResultMessage,
 	validateToolArguments,
 } from "@mariozechner/pi-ai";
+import { createSmoothStream } from "./smooth-stream.js";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -230,11 +231,15 @@ async function streamAssistantResponse(
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
 
-	const response = await streamFunction(config.model, llmContext, {
+	const rawResponse = await streamFunction(config.model, llmContext, {
 		...config,
 		apiKey: resolvedApiKey,
 		signal,
 	});
+
+	// Wrap provider stream: splits deltas into small tokens with correct
+	// incremental partials. The agent loop just uses event.partial directly.
+	const response = createSmoothStream(rawResponse, signal);
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;

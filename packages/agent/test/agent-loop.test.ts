@@ -128,6 +128,70 @@ describe("agentLoop with AgentMessage", () => {
 		expect(eventTypes).toContain("agent_end");
 	});
 
+	it("should split large text deltas into multiple message_update events", async () => {
+		const context: AgentContext = {
+			systemPrompt: "You are helpful.",
+			messages: [],
+			tools: [],
+		};
+
+		const userPrompt: AgentMessage = createUserMessage("Hello");
+		const streamedText =
+			"This is a long provider delta that should be split into smaller chunks for smoother UI updates.";
+
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+		};
+
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const startPartial = createAssistantMessage([{ type: "text", text: "" }]);
+				const finalPartial = createAssistantMessage([{ type: "text", text: streamedText }]);
+				stream.push({ type: "start", partial: startPartial });
+				stream.push({ type: "text_start", contentIndex: 0, partial: startPartial });
+				stream.push({ type: "text_delta", contentIndex: 0, delta: streamedText, partial: finalPartial });
+				stream.push({ type: "text_end", contentIndex: 0, content: streamedText, partial: finalPartial });
+				stream.push({ type: "done", reason: "stop", message: finalPartial });
+			});
+			return stream;
+		};
+
+		const events: AgentEvent[] = [];
+		const stream = agentLoop([userPrompt], context, config, undefined, streamFn);
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const textDeltaUpdates = events.filter(
+			(
+				event,
+			): event is Extract<AgentEvent, { type: "message_update" }> & {
+				assistantMessageEvent: Extract<AssistantMessageEvent, { type: "text_delta" }>;
+			} => {
+				return event.type === "message_update" && event.assistantMessageEvent.type === "text_delta";
+			},
+		);
+
+		// Should be split into multiple tokens
+		expect(textDeltaUpdates.length).toBeGreaterThan(1);
+
+		// Reassembled deltas must exactly match original text
+		const deltas = textDeltaUpdates.map((u) => u.assistantMessageEvent.delta);
+		const reassembled = deltas.join("");
+		expect(reassembled).toBe(streamedText);
+
+		// Provider partial is forwarded unchanged
+		const lastMessage = textDeltaUpdates[textDeltaUpdates.length - 1].message;
+		if (lastMessage.role === "assistant") {
+			const firstContent = lastMessage.content[0];
+			if (firstContent?.type === "text") {
+				expect(firstContent.text).toBe(streamedText);
+			}
+		}
+	});
+
 	it("should handle custom message types via convertToLlm", async () => {
 		// Create a custom message type
 		interface CustomNotification {
